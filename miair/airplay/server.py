@@ -190,14 +190,18 @@ class PlaybackPacer:
             else:
                 # 后续同步: 计算漂移率
                 # 注意: 必须用「无目标延迟补偿」的速率锚点来测速率，
-                # 否则每段时间比恒偏小 (~0.8)，会把漂移率 EMA 拽到 0.8，
-                # 导致实际输出速率只有 44.1k*0.8 ≈ 35.3kHz —— 音箱侧缓冲
-                # 持续被抽空，表现为 Apple Music 播放周期性卡顿/断断续续。
+                # 否则每段时间比恒偏小 (target_latency/d4_interval ≈ 0.8)，
+                # 会把漂移率 EMA 拽到 ~0.87，导致实际输出速率只有
+                # 44.1k*0.87 ≈ 38.5kHz —— 音箱侧缓冲持续被抽空，
+                # 表现为 Apple Music 播放周期性卡顿/断断续续。
                 if self._rate_anchor_rtp is not None:
                     audio_elapsed = (play_at_rtp_ts - self._rate_anchor_rtp) / self._sample_rate
                     real_elapsed = now_perf - self._rate_anchor_perf
                     if audio_elapsed > 0.5:
                         measured_rate = real_elapsed / audio_elapsed
+                        # 限幅: 真实晶振偏差 <1%，超出视为 D4 包到达抖动造成的
+                        # 单次测量噪声，夹住避免 EMA 被异常样本拉偏
+                        measured_rate = min(max(measured_rate, 0.95), 1.05)
                         # EMA 更新 (alpha=0.05 温和收敛)
                         self._drift_rate += 0.05 * (measured_rate - self._drift_rate)
                         # 定期重锚点防止累积误差
