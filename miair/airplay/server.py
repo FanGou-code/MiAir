@@ -126,22 +126,42 @@ class PlaybackPacer:
     时间锚点由 D4 sync 包 (RTCP TIME_ANNOUNCE) 提供：
       playAtRtpTimestamp 对应 NTP 时间 → 映射到本地 perf_counter。
     无锚点时退化为启动缓冲模式（累积 32 帧后立即释放）。
+
+    设计要点:
+    - 漂移率用独立速率锚点测量 (不含目标延迟补偿)，避免把固定提前量
+      误判成时钟漂移，导致输出速率被系统性拖慢
+    - 帧释放时刻做相邻连续化，消化 D4 锚点更新带来的相位跳变
+    - 仅在数据流真实停滞时才跳帧，正常网络抖动下保持连续输出
     """
 
-    def __init__(self, sample_rate: int = 44100):
+    def __init__(self, sample_rate: int = 44100, device_name: str = ""):
         self._sample_rate = sample_rate
+        self._device_name = device_name
+        self._tag = f"[{device_name}] " if device_name else ""
         # 锚点: RTP 时间戳 → 本地 perf_counter 时间
         self._anchor_rtp_ts: int | None = None
         self._anchor_perf: float = 0.0
         self._lock = threading.Lock()
         # 漂移校正: 实际/期望时间比的 EMA
         self._drift_rate: float = 1.0
+        # 漂移率专用锚点 (与播放锚点分开，避免把目标延迟算进速率)
+        self._rate_anchor_rtp: int | None = None
+        self._rate_anchor_perf: float = 0.0
         # 目标延迟: 帧释放提前量，补偿 HTTP 缓冲 + 网络 + 音箱缓冲
-        self._target_latency_sec: float = 0.200
+        self._target_latency_sec: float = 0.150
+        # 单帧最大推进量 (1.5 帧): 平滑追赶时输出速率上限约 1.5x 实时，
+        # 既能在漂移后拉齐时间基准，又不会产生可闻的加速感
+        self._max_frame_advance: float = 352 / sample_rate * 1.5
+        # 上一帧的未补偿释放时刻，用于连续化各 D4 锚点段 (消除锚点跳变)
+        self._last_sched_perf: float | None = None
         # 启动缓冲
         self._startup_count: int = 0
         self._startup_target: int = 32  # ~256ms
         self._started: bool = False
+        # 迟到跳帧保护 (仅在数据流停滞时才丢帧，正常抖动绝不丢)
+        self._last_frame_perf: float = time.perf_counter()
+        self._stall_skip_count: int = 0
+        self._last_skip_log: float = 0.0
 
     @property
     def has_anchor(self) -> bool:
@@ -164,17 +184,27 @@ class PlaybackPacer:
                 self._anchor_perf = now_perf + self._target_latency_sec
                 self._started = False
                 self._startup_count = 0
+                self._rate_anchor_rtp = play_at_rtp_ts
+                self._rate_anchor_perf = now_perf
+                self._last_sched_perf = None
             else:
                 # 后续同步: 计算漂移率
-                audio_elapsed = (play_at_rtp_ts - self._anchor_rtp_ts) / self._sample_rate
-                real_elapsed = now_perf - self._anchor_perf
-                if audio_elapsed > 0.5:
-                    measured_rate = real_elapsed / audio_elapsed
-                    # EMA 更新 (alpha=0.05 温和收敛)
-                    self._drift_rate += 0.05 * (measured_rate - self._drift_rate)
-                    # 定期重锚点防止累积误差
-                    self._anchor_rtp_ts = play_at_rtp_ts
-                    self._anchor_perf = now_perf + self._target_latency_sec
+                # 注意: 必须用「无目标延迟补偿」的速率锚点来测速率，
+                # 否则每段时间比恒偏小 (~0.8)，会把漂移率 EMA 拽到 0.8，
+                # 导致实际输出速率只有 44.1k*0.8 ≈ 35.3kHz —— 音箱侧缓冲
+                # 持续被抽空，表现为 Apple Music 播放周期性卡顿/断断续续。
+                if self._rate_anchor_rtp is not None:
+                    audio_elapsed = (play_at_rtp_ts - self._rate_anchor_rtp) / self._sample_rate
+                    real_elapsed = now_perf - self._rate_anchor_perf
+                    if audio_elapsed > 0.5:
+                        measured_rate = real_elapsed / audio_elapsed
+                        # EMA 更新 (alpha=0.05 温和收敛)
+                        self._drift_rate += 0.05 * (measured_rate - self._drift_rate)
+                        # 定期重锚点防止累积误差
+                        self._rate_anchor_rtp = play_at_rtp_ts
+                        self._rate_anchor_perf = now_perf
+                self._anchor_rtp_ts = play_at_rtp_ts
+                self._anchor_perf = now_perf + self._target_latency_sec
 
     def wait_for_frame(self, rtp_timestamp: int) -> bool:
         """解码线程调用。等到帧应该释放的时刻。
@@ -183,6 +213,7 @@ class PlaybackPacer:
         if rtp_timestamp == 0:
             return True  # 静音帧直接播放
 
+        now = time.perf_counter()
         with self._lock:
             if self._anchor_rtp_ts is None:
                 # 无锚点: 启动缓冲模式
@@ -194,17 +225,38 @@ class PlaybackPacer:
             # 计算此帧应该释放的时刻
             audio_offset = (rtp_timestamp - self._anchor_rtp_ts) / self._sample_rate
             target_perf = self._anchor_perf + audio_offset * self._drift_rate
+            # 连续化: 释放时刻最多推进到上一帧之后一帧半的位置。
+            # D4 锚点更新 / 时钟抖动造成的相位跳变被摊平成最多 1.5x 的
+            # 平滑追赶，绝不产生比一帧更长的输出空档 (可闻卡顿)。
+            base = self._last_sched_perf
+            if base is not None:
+                limit = base + self._max_frame_advance
+                if target_perf > limit:
+                    target_perf = limit
 
-        now = time.perf_counter()
         wait_time = target_perf - now
 
         if wait_time > 0.005:  # 超过 5ms 才 sleep
             time.sleep(wait_time)
-            return True
-        elif wait_time < -0.100:  # 超过 100ms 过期
-            return False  # 跳过
-        else:
-            return True  # 稍微迟到但可接受
+            target_perf = time.perf_counter()
+        elif wait_time < -0.150:
+            # 严重迟到: 仅在数据流真实停滞 (>250ms 无音频) 时跳过该帧，
+            # 正常情况下 (抖动 <150ms) 始终保持连续不丢帧
+            if now - self._last_frame_perf > 0.25:
+                self._stall_skip_count += 1
+                if now - self._last_skip_log > 5.0:
+                    self._last_skip_log = now
+                    log.warning(
+                        f"{self._tag}Pacer: 数据流停滞，跳过迟到帧 "
+                        f"(累计 {self._stall_skip_count} 帧)"
+                    )
+                self._last_frame_perf = now
+                return False
+
+        with self._lock:
+            self._last_sched_perf = target_perf
+        self._last_frame_perf = now
+        return True
 
     def reset(self) -> None:
         """FLUSH 时重置。"""
@@ -212,8 +264,15 @@ class PlaybackPacer:
             self._anchor_rtp_ts = None
             self._anchor_perf = 0.0
             self._drift_rate = 1.0
+            self._rate_anchor_rtp = None
+            self._rate_anchor_perf = 0.0
+            self._last_sched_perf = None
             self._startup_count = 0
             self._started = False
+            # 迟到跳帧保护 (仅在数据流停滞时才丢帧，正常抖动绝不丢)
+            self._last_frame_perf = time.perf_counter()
+            self._stall_skip_count = 0
+
 
 
 class NTPClockSync:
@@ -392,6 +451,8 @@ class AirPlayServer:
         self._timing_socket: socket.socket | None = None
         self._timing_request_seq: int = 0
         self._rtsp_client_addr: tuple | None = None  # RTSP 客户端 IP
+        # 会话代号: 每次新 RECORD 递增；旧 RTP 接收线程据此识别自己被替换而退出
+        self._session_gen: int = 0
 
     def _generate_device_id(self) -> str:
         """生成设备 MAC 地址格式的 ID
@@ -602,9 +663,11 @@ class AirPlayServer:
                     self._handle_record(sock, cseq)
                     # 启动 RTP 接收线程
                     if rtp_socket and not rtp_thread:
+                        # 新会话: 递增代号，让可能残留的旧接收线程自行退出
+                        self._session_gen += 1
                         rtp_thread = threading.Thread(
                             target=self._rtp_receive_loop,
-                            args=(rtp_socket,),
+                            args=(rtp_socket, self._session_gen),
                             daemon=True,
                         )
                         rtp_thread.start()
@@ -1228,19 +1291,22 @@ class AirPlayServer:
         finally:
             timing_socket.close()
 
-    def _rtp_receive_loop(self, rtp_socket: socket.socket):
+    def _rtp_receive_loop(self, rtp_socket: socket.socket, session_gen: int = 0):
         """RTP 音频数据接收循环 — 两阶段管道 + 时间调度
 
         Stage 1 (receiver): recvfrom → 环形缓冲区 → 按序发送到解码队列
         Stage 2 (decoder):  解码队列 → PlaybackPacer 调度 → 解密 → ALAC 解码 → write_pcm
 
         接收线程只做 UDP 读取和轻量操作，永远不被解码阻塞。
+        session_gen: 会话代号；当新 RECORD/FLUSH 替换会话后，旧线程据此自行退出。
         """
         log.info("RTP 接收线程启动")
+        my_gen = session_gen
 
         # 等待流媒体激活
         wait_count = 0
-        while self._running and not self._stream_server._active and wait_count < 50:
+        while (self._running and self._session_gen == my_gen
+               and not self._stream_server._active and wait_count < 50):
             time.sleep(0.1)
             wait_count += 1
 
@@ -1262,6 +1328,12 @@ class AirPlayServer:
         # 解码队列
         decode_queue: queue.Queue[PacketData | None] = queue.Queue(maxsize=200)
         running = True
+
+        # 检查会话是否已被替换（新 RECORD/FLUSH 会重置 _session_gen）
+        if self._session_gen != my_gen:
+            log.info("RTP: 会话已被新播放请求替换，退出接收线程")
+            rtp_socket.close()
+            return
 
         # ---- Stage 2: 解码线程（带 pacer 调度） ----
         def _decoder_worker():
@@ -1325,7 +1397,7 @@ class AirPlayServer:
             _retransmit_state: dict[int, tuple[float, int]] = {}
             _RETRANSMIT_BASE_INTERVAL = 0.040  # 40ms
             _RETRANSMIT_MAX_INTERVAL = 1.000
-            _RETRANSMIT_GIVE_UP_TIME = 2.0  # 2秒后放弃
+            _RETRANSMIT_GIVE_UP_TIME = 1.0  # 1秒仍无法补齐则按静音跳过，避免长时间断音
 
             while self._running:
                 try:
@@ -1366,7 +1438,6 @@ class AirPlayServer:
                         _retransmit_state.clear()
                         if _pacer:
                             _pacer.reset()
-                        continue
 
                     # 按序 drain 到解码队列
                     drained = jb.drain(next_seq)
@@ -1439,7 +1510,8 @@ class AirPlayServer:
             log.error(f"RTP 接收错误: {e}")
         finally:
             running = False
-            if self._timing_pacer:
+            # 仅在未被新会话替换时才重置共享 pacer，避免旧线程复位新会话状态
+            if self._session_gen == my_gen and self._timing_pacer:
                 self._timing_pacer.reset()
             try:
                 decode_queue.put_nowait(None)

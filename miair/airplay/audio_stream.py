@@ -49,6 +49,14 @@ class AudioStreamServer:
         self._session_id = int(time.time())
         self._has_clients = False
         self._client_lock = threading.Lock()
+        # PCM 丢弃统计 (队列满时) — 正常不应发生，仅在持续过载时出现
+        self._drop_count = 0
+        self._last_drop_log = 0.0
+        # 出流指令时间基准 (RECORD/FLUSH → start_streaming)，用于连接/写点打点
+        self._play_requested_at: float = 0.0
+        # 已连接客户端的"音箱侧已消费"时间 (最后写入成功时刻)，
+        # 写入前用它检查积压，避免把数据堆进内核缓冲后只能丢弃
+        self._last_write_perf: float = 0.0
 
         self._setup_routes()
 
@@ -89,6 +97,7 @@ class AudioStreamServer:
         self._active = True
         self._abort = False
         self._session_id = int(time.time())
+        self._play_requested_at = time.perf_counter()
         # 快速清空队列
         while True:
             try:
@@ -112,25 +121,36 @@ class AudioStreamServer:
         log.info("音频流: 停止接收 PCM 数据")
 
     def write_pcm(self, data: bytes):
-        """写入 PCM 音频数据 — 非阻塞，队列满时批量丢弃旧数据腾出空间"""
+        """写入 PCM 音频数据 — 非阻塞
+
+        队列满时丢弃「最旧」的数据（而非整体清空 25%）：PCM 是连续时间
+        序列，丢弃最旧数据等价于播放端整体前移，音箱侧表现为轻微时间跳跃
+        但不静音；清空 25% 会瞬间掏空音箱缓冲造成明显卡顿。
+        """
         if not self._active:
             return
         try:
             self._audio_queue.put_nowait(data)
+            return
         except queue.Full:
-            # 批量丢弃旧数据，一次性腾出足够空间，避免反复 put/get 开销
-            dropped = 0
-            target = _QUEUE_MAXSIZE // 4  # 丢弃 25% 腾出充裕空间
-            try:
-                for _ in range(target):
-                    self._audio_queue.get_nowait()
-                    dropped += 1
-            except queue.Empty:
-                pass
-            try:
-                self._audio_queue.put_nowait(data)
-            except queue.Full:
-                pass
+            pass
+        # 丢弃最旧数据，为最新 PCM 腾空间 (音频连续性优先)
+        try:
+            self._audio_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._audio_queue.put_nowait(data)
+        except queue.Full:
+            pass
+        self._drop_count += 1
+        now = time.perf_counter()
+        if now - self._last_drop_log > 10.0:
+            self._last_drop_log = now
+            log.warning(
+                f"音频流: PCM 队列积压，丢弃最旧数据 "
+                f"(累计 {self._drop_count} 帧) — 下游消费过慢"
+            )
 
     # ============================================================
     # WAV 模式 — 直接输出 PCM，零编码延迟
@@ -189,6 +209,7 @@ class AudioStreamServer:
 
         with self._client_lock:
             self._has_clients = True
+            self._last_write_perf = time.perf_counter()
         self._abort = False  # 重置中断标志，允许续播
 
         log.info("AirPlay: 音箱开始拉取 WAV 音频流 (零编码延迟)")
@@ -246,6 +267,7 @@ class AudioStreamServer:
             # 发送 WAV 头
             await response.write(self._build_wav_header())
 
+            last_write_dur = 0.0
             while not writer_done:
                 await data_ready.wait()
                 data_ready.clear()
@@ -253,8 +275,22 @@ class AudioStreamServer:
                     chunks = pending_data
                     pending_data = []
                 if chunks:
+                    if last_write_dur > 0.5 and len(chunks) > 1:
+                        # 上一次写阻塞超过 0.5s = 音箱侧背压 (网络拥塞/固件卡顿)，
+                        # 期间积压的批次直接丢弃最旧一半，推进到最新音频，
+                        # 避免逐块延迟累积后音箱只能靠重连恢复
+                        dropped = len(chunks) // 2
+                        log.warning(
+                            f"AirPlay: 音箱侧背压 {last_write_dur:.1f}s，"
+                            f"丢弃 {dropped} 个积压块追赶实时音频"
+                        )
+                        chunks = chunks[dropped:]
                     # 批量写入：合并所有 chunk 一次性写出
+                    _t0 = time.perf_counter()
                     await response.write(b"".join(chunks))
+                    last_write_dur = time.perf_counter() - _t0
+                    with self._client_lock:
+                        self._last_write_perf = time.perf_counter()
         except (ConnectionResetError, BrokenPipeError):
             log.info("AirPlay: 音箱断开 WAV 音频流连接")
         except Exception as e:
