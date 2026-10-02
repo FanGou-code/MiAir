@@ -180,13 +180,15 @@ class PlaybackPacer:
         with self._lock:
             if self._anchor_rtp_ts is None:
                 # 首次同步: 建立锚点
+                # 注意: 不清空 _last_sched_perf —— FLUSH 换轨后首帧若被排到
+                # 新锚点段的大目标时刻上，HTTP 流会出现数百毫秒空档；
+                # 保留上一帧释放时刻，让新映射经 ≤1.5x 平滑追赶收敛。
                 self._anchor_rtp_ts = play_at_rtp_ts
                 self._anchor_perf = now_perf + self._target_latency_sec
                 self._started = False
                 self._startup_count = 0
                 self._rate_anchor_rtp = play_at_rtp_ts
                 self._rate_anchor_perf = now_perf
-                self._last_sched_perf = None
             else:
                 # 后续同步: 计算漂移率
                 # 注意: 必须用「无目标延迟补偿」的速率锚点来测速率，
@@ -263,14 +265,20 @@ class PlaybackPacer:
         return True
 
     def reset(self) -> None:
-        """FLUSH 时重置。"""
+        """FLUSH 时重置。
+
+        注意: 保留 _last_sched_perf。FLUSH 换轨后，若直接清空会丢失
+        「上一帧释放时刻」这个连续化基准，新锚点建立时第一帧可能被
+        排到 (目标延迟 + 在途缓冲) 之后，在 HTTP 流里插进数百毫秒空档，
+        音箱侧缓冲被抽空 → 换歌时的可闻卡顿。保留基准后，新映射通过
+        每帧 ≤1.5 的平滑追赶收敛，换轨无空档。
+        """
         with self._lock:
             self._anchor_rtp_ts = None
             self._anchor_perf = 0.0
             self._drift_rate = 1.0
             self._rate_anchor_rtp = None
             self._rate_anchor_perf = 0.0
-            self._last_sched_perf = None
             self._startup_count = 0
             self._started = False
             # 迟到跳帧保护 (仅在数据流停滞时才丢帧，正常抖动绝不丢)
