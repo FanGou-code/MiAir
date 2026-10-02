@@ -217,7 +217,10 @@ class PlaybackPacer:
         返回 True = 播放，False = 太晚了跳过。
         """
         if rtp_timestamp == 0:
-            return True  # 静音帧直接播放
+            # 静音帧直接播放；同时刷新输出时间戳，避免长时间静音保持后
+            # 把下一帧真实音频误判为「停滞后的迟到帧」而丢弃
+            self._last_frame_perf = time.perf_counter()
+            return True
 
         now = time.perf_counter()
         with self._lock:
@@ -235,6 +238,12 @@ class PlaybackPacer:
             # D4 锚点更新 / 时钟抖动造成的相位跳变被摊平成最多 1.5x 的
             # 平滑追赶，绝不产生比一帧更长的输出空档 (可闻卡顿)。
             base = self._last_sched_perf
+            if base is not None and now - base > 0.5:
+                # 调度基准已过期 (暂停/长时间无帧): 不能拿陈旧基准做钳制，
+                # 否则目标时刻被钳到远在过去的值，恢复播放时会以解码全速
+                # 把积压音频一次性倾泻给音箱。丢弃旧基准，按真实目标时刻
+                # 重新调度 (至多出现一次与旧行为一致的短暂等待)。
+                base = None
             if base is not None:
                 limit = base + self._max_frame_advance
                 if target_perf > limit:
