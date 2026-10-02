@@ -208,11 +208,18 @@ class AudioStreamServer:
                 sock.setsockopt(_sock.IPPROTO_TCP, _sock.TCP_NODELAY, 1)
 
         with self._client_lock:
+            fresh_connect = not self._has_clients
             self._has_clients = True
             self._last_write_perf = time.perf_counter()
         self._abort = False  # 重置中断标志，允许续播
 
-        log.info("AirPlay: 音箱开始拉取 WAV 音频流 (零编码延迟)")
+        if fresh_connect and self._play_requested_at > 0:
+            log.info(
+                f"AirPlay: 音箱开始拉取 WAV 音频流 "
+                f"(出流指令→音箱连接 {(time.perf_counter() - self._play_requested_at) * 1000:.0f}ms)"
+            )
+        else:
+            log.info("AirPlay: 音箱开始拉取 WAV 音频流 (零编码延迟)")
 
         # 使用 asyncio.Event 在写入线程和事件循环间通信
         loop = asyncio.get_event_loop()
